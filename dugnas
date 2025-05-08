@@ -1,0 +1,1922 @@
+# Standartinės bibliotekos
+import sys
+import asyncio
+import time
+import re
+import json
+from datetime import datetime, timezone, timedelta
+from collections import deque
+from typing import Dict, Set, Union, Optional, Tuple
+
+# Trečiųjų šalių bibliotekos
+import aiohttp
+from telethon import TelegramClient, events
+
+# Logging
+import logging
+import logging.handlers
+
+# Logging konfigūracija
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s UTC - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+file_handler = logging.handlers.RotatingFileHandler(
+    'token_monitor.log',
+    maxBytes=5*1024*1024,
+    backupCount=3,
+    encoding='utf-8'
+)
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
+
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+# Konfigūracija
+TELEGRAM_API_ID = '25425140'
+TELEGRAM_API_HASH = 'bd0054bc5393af360bc3930a27403c33'
+TELEGRAM_SOURCE_CHATS = ['@gmgnsignals']  # '@pump2ray',  '@fasol_vol',  '@solvolumealert' '@PumpFunRaydium', '@edgaronsol',  '@solautobot_pumpfunalert','@PumpFunRaydium', 
+TELEGRAM_DEST_CHAT = ['@REKTsol_bot']
+
+# BirdEye API konfigūracija
+BIRDEYE_API_KEY = "6291a948e28046a59385b9ced2ecca25"  # Replace with your actual BirdEye API key
+BIRDEYE_BASE_URL = "https://public-api.birdeye.so/defi/ohlcv"
+POLLING_INTERVAL = 60
+MAX_CONCURRENT_TOKENS = 200
+RATE_LIMIT_PER_MIN = 200
+
+# Trading konfigūracija optimizuota naujiems tokenams 
+TRADING_CONFIG = {
+    # ATH parametrai
+    'min_ath_increase': 0.01,    # Minimalus ATH padidėjimas (0%)
+    'max_ath_increase': 70.0,    # Maksimalus ATH padidėjimas (40%)
+    'max_ath_threshold': 0.000045, # SUMAZINTI ATH JEI BLOGAI BUS, IKI 40 000 AR DAR MAZIAU
+    'min_price_threshold': 0.000018, # Minimalus kainos slenkstis signalui
+    'ath_calibration_time': 15,  # Pradinės ATH kalibracijos laikas sekundėmis
+    'min_price_calibration_time': 15,  # Minimalios kainos kalibracijos laikas sekundėmis
+    'ath_confirmation_time': 15, # ATH patvirtinimo laikas sekundėmis
+    
+    # NAUJI parametrai - kainos kritimo stebėjimui
+    'min_drop_percent': 30,     # Minimalus nukritimas nuo ATH (%)
+    'max_drop_percent': 75,     # Maksimalus nukritimas nuo ATH (%)
+    
+    # NAUJAS parametras - reikalaujamas minimalus atsigavimas
+    'min_recovery_percent': 100, # Minimalus atsigavimo procentas po pullback (%)
+    'max_recovery_percent': 200, # Maksimalus atsigavimo procentas po pullback (%)
+    
+    # NAUJI parametrai - laiko stebėjimui
+    'min_signal_time': 120,      # Minimalus laikas sekundėmis nuo stebėjimo pradžios iki signalo (4 minutės)
+    'max_signal_time': 1200,    # Maksimalus laikas sekundėmis nuo stebėjimo pradžios iki signalo (20 minučių)
+    
+    # API parametrai
+    'pumpfun_polling_interval': 8,    
+    'pumpfun_max_retries': 3,
+
+    # Laiko parametrai
+    'max_token_age': 1200,    # 20 minučių
+    'min_token_age': 12,     # 12 sekundžių
+    'update_interval': 60,   # 60 sekundžių
+    'max_wait_time': 1200,    # 20 minučių
+
+    # NAUJI parametrai - signalų siuntimo laiko intervalai (UTC)
+    'signal_time_intervals': [
+        {'start': '22:00', 'end': '21:59'},
+        #{'start': '19:00', 'end': '23:07'}
+    ],
+    
+    # Kainos istorijos parametrai
+    'price_history_minutes': 15,  # Kainos istorijos intervalas minutėmis
+    
+    # NAUJI parametrai - skaneriss duomenų filtravimui
+    'max_hold_count': 8,        # Maksimalus "Hold" skaičius
+    'max_sold_part_count': 8,   # Maksimalus "Sold part" skaičius
+    'min_sold_count': 36,        # Minimalus "Sold" skaičius
+    'skaneriss_wait_timeout': 30,  # Kiek sekundžių laukti atsakymo iš skaneriss
+
+    # NAUJAS: TrenchScannerBot parametrai
+    'max_held_percentage': 20.0,  # Maksimalus "Current Held Percentage" iš TrenchScannerBot
+    'trenchscanner_wait_timeout': 30  # Kiek sekundžių laukti atsakymo iš TrenchScannerBot
+
+}
+
+class TokenPriceMonitor:
+    def __init__(self):
+        self.client = TelegramClient('session_name', TELEGRAM_API_ID, TELEGRAM_API_HASH)
+        self.sent_signals: Dict[str, datetime] = {}
+        self.session = None
+        self.monitoring_tokens = set()
+        self.start_time = datetime.now(timezone.utc)
+        self.last_request_time = {}
+        self.last_update_time = {}  
+        self.token_start_times = {}  # Būtina saugoti token pradžios laikus
+        self.cached_data = {}  
+        
+        # Kainų istorijos sekimas
+        self.price_history: Dict[str, list] = {}  # Kainų istorija su laiko žymomis
+        
+        # ATH sekimas
+        self.token_ath = {}
+        self.ath_timestamps = {}  # Kada buvo pasiektas paskutinis ATH
+
+        # NAUJAS: TrenchScannerBot duomenys
+        self.trenchscanner_data = {}
+        self.trenchscanner_requests_sent = set()  # Šio trūksta
+        self.waiting_for_trenchscanner = {}
+        self.active_requests = {}
+        self.last_token_sent = None
+        
+        # API sesijos
+        self.pumpfun_session = None
+        self.dexscreener_session = None  # Laikome dėl Solana Tracker API
+        self.initial_prices: Dict[str, float] = {}
+        self.token_start_prices: Dict[str, float] = {}
+        
+        # Pridedame whitelist žodžių sąrašą
+        self.whitelist_words = [
+            "Surge"
+        ]
+        
+        # Pridedame blacklist žodžių sąrašą
+        self.blacklist_phrases = [
+            #"Created at : a few seconds ago",
+            #"Age: 0m", "Age: 1m", "Age: 2m", "Age: 3m", "Age: 4m", "Age: 5m", "Age: 6m",
+            #"Age: 7m", "Age: 8m", "Age: 9m", "Age: 10m", "Age: 11m"
+            #"Age: 12m", "Age: 13m",
+            #"Age: 14m", "Age: 15m", "Age: 16m", "Age: 17m", "Age: 18m", "Age: 19m", "Age: 20m"  
+        ]
+        
+        # Pridedame set'ą apdorotų žinučių sekimui
+        self.last_processed_messages = set()
+        self.max_cache_size = 1000
+        
+        # Nauja: Sekti ar ATH buvo jau praneštas
+        self.ath_signaled = set()
+        
+        # Nauji kintamieji ATH monitoringui
+        self.calibration_status = {}  # {token: {'start_time': start_time, 'max_ath': max_ath, 'calibrated': bool}}
+        
+        # Naujas: ATH patvirtinimo mechanizmas
+        self.ath_cross_candidates = {}  # {token: {'cross_time': time, 'cross_price': price, 'prev_ath': prev_ath}}
+        
+        # NAUJI kintamieji PULLBACK monitoringui
+        self.price_drop_status = {}  # {token: {'min_price': price, 'max_drop_percent': percent, 'pullback_detected': bool}}
+        
+        # NAUJAS: papildomi token duomenys iš GMGN žinučių
+        self.token_extra_data = {}  # {token_address: {'tx_count': 108, 'volume': "$7.9K", 'holders': 89, 'top10_percent': 29.76, 'age': "3min ago"}}
+        
+        # NAUJAS: papildomi duomenys iš skaneriss
+        self.skaneriss_data = {}  # {token_address: {'hold_count': 14, 'sold_part_count': 14, 'sold_count': 33}}
+        
+        # NAUJAS: skirti valdyti skaneriss laukimui
+        self.waiting_for_skaneriss = {}  # {token_address: event}
+        
+        # NAUJAS: skaneriss užklausų sekimui, kad nesiųstų pakartotinai
+        self.skaneriss_requests_sent = set()  # Tokenai, kuriems jau išsiųstas užklausimas į @skaneriss
+        
+        current_time = datetime.now(timezone.utc)
+        current_date = current_time.strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(f"Current Date and Time (UTC - YYYY-MM-DD HH:MM:SS formatted): {current_date}")
+        logger.info(f"Current User's Login: minijus05")
+
+    async def cleanup_old_messages(self):
+        """Išvalo senus message ID iš cache"""
+        if len(self.last_processed_messages) > self.max_cache_size:
+            # Paliekame tik paskutinius N įrašų
+            sorted_messages = sorted(self.last_processed_messages)
+            self.last_processed_messages = set(sorted_messages[-self.max_cache_size:])
+
+    async def initialize_session(self):
+        """Initialize aiohttp sessions"""
+        # Sukuriame bendrą sesiją
+        self.session = aiohttp.ClientSession()
+        
+        # Inicializuojame PumpFun API sesiją
+        self.pumpfun_session = aiohttp.ClientSession()
+        
+        # Išlaikome DexScreener sesiją dėl Solana Tracker API
+        self.dexscreener_session = aiohttp.ClientSession()
+        
+        logger.info("Initialized API sessions")
+    
+    async def get_pumpfun_price(self, token_address: str, get_ath=False) -> Union[Optional[float], Tuple[Optional[float], Optional[float]]]:
+        """
+        Fetch current token price from PumpFun API
+        
+        Args:
+            token_address: Tokeno adresas
+            get_ath: Ar grąžinti ir ATH kainą
+            
+        Returns:
+            Jei get_ath=False: Optional[float] - dabartinė kaina
+            Jei get_ath=True: Tuple[Optional[float], Optional[float]] - (dabartinė kaina, ATH kaina)
+        """
+        try:
+            # PumpFun API endpoint URL
+            url = f"https://api.pumpfunapi.org/price/{token_address}"
+            
+            for retry in range(TRADING_CONFIG['pumpfun_max_retries']):
+                try:
+                    async with self.pumpfun_session.get(url) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            
+                            # Tikriname naują API atsakymo formatą
+                            if 'USD' in data and 'SOL' in data:
+                                # Gauname kainas
+                                price_in_sol = float(data['SOL'])
+                                price_in_usd = float(data['USD'])
+                                
+                                # Nustatome kurią kainą naudoti - USD
+                                price = price_in_usd
+                                
+                                # Loginame informaciją
+                                logger.info(f"PumpFun price for {token_address}: ${price:.8f} (SOL: {price_in_sol:.8f})")
+                                
+                                # Jei neprašoma ATH, grąžiname tik kainą
+                                if not get_ath:
+                                    return price
+                                
+                                # Jei prašoma ATH, grąžiname tik dabartinę kainą
+                                # PumpFun API tiesiogiai nesuteikia ATH kainos
+                                return price, price
+                            else:
+                                logger.warning(f"Unexpected data format for {token_address} in PumpFun API response: {data}")
+                        else:
+                            logger.warning(f"PumpFun API returned status {response.status}")
+                            
+                except Exception as e:
+                    logger.error(f"Error in PumpFun API request (attempt {retry + 1}): {e}")
+                    if retry < TRADING_CONFIG['pumpfun_max_retries'] - 1:
+                        await asyncio.sleep(1)
+                    continue
+                        
+            logger.error(f"Failed to get PumpFun price after {TRADING_CONFIG['pumpfun_max_retries']} attempts")
+            return (None, None) if get_ath else None
+                
+        except Exception as e:
+            logger.error(f"Error fetching PumpFun price: {e}")
+            return (None, None) if get_ath else None
+
+    async def should_update(self, token_address: str) -> bool:
+        """Check if it's time to update the token data"""
+        if token_address not in self.last_update_time:
+            return True
+        
+        now = datetime.now(timezone.utc)
+        last_update = datetime.fromtimestamp(self.last_update_time[token_address], tz=timezone.utc)
+        return (now - last_update).total_seconds() >= 60
+
+    def extract_token_details(self, message: str) -> dict:
+        """Ištraukia papildomus duomenis apie token'ą iš GMGN žinutės"""
+        details = {}
+        
+        # Išsaugome visą žinutę į logą
+        logger.debug(f"FULL MESSAGE:\n{message}")
+        
+                
+        # Tokeno amžius - pataisytas algoritmas
+        for line in message.split('\n'):
+            if 'Open:' in line or '🕒' in line:
+                age = re.search(r'(\d+min|\d+h|\d+d)', line)
+                if age:
+                    details['age'] = age.group(1)
+                    logger.info(f"Extracted Age: {details['age']} from line: {line}")
+                    break
+        
+        # Patikrinti ar bent vienas laukas buvo išgautas
+        if not details:
+            logger.warning(f"No token details extracted from message.")
+            logger.warning(f"MESSAGE START\n{message}\nMESSAGE END")
+        else:
+            logger.info(f"Successfully extracted token details: {details}")
+        
+        return details
+        
+    async def extract_skaneriss_data(self, message: str) -> dict:
+        """Ištraukia papildomus duomenis iš skaneriss žinutės"""
+        data = {}
+        
+        # Išsaugome visą žinutę į logą
+        logger.debug(f"SKANERISS MESSAGE:\n{message}")
+        
+        # Ieškome Hold ir Sold part informacijos
+        hold_sold_pattern = r'📊\s*Hold\s*(\d+)\s*\|\s*📊\s*Sold\s*part\s*(\d+)'
+        hold_sold_match = re.search(hold_sold_pattern, message)
+        
+        if hold_sold_match:
+            data['hold_count'] = int(hold_sold_match.group(1))
+            data['sold_part_count'] = int(hold_sold_match.group(2))
+            logger.info(f"Extracted from skaneriss: Hold count: {data['hold_count']}, Sold part: {data['sold_part_count']}")
+        else:
+            logger.warning("Could not extract Hold/Sold part information from skaneriss message")
+        
+        # Ieškome Sold informacijos (pilni pardavėjai)
+        sold_pattern = r'📊\s*Sold\s*(\d+)'
+        sold_match = re.search(sold_pattern, message)
+        
+        if sold_match:
+            data['sold_count'] = int(sold_match.group(1))
+            logger.info(f"Extracted from skaneriss: Sold count: {data['sold_count']}")
+        else:
+            # Bandome ieškoti kitoje vietoje - pilnos linijos, kuri turi visą informaciją
+            full_line_pattern = r'📊\s*Hold\s*\d+\s*\|\s*📊\s*Sold\s*part\s*\d+\s*\|\s*📊\s*Sold\s*(\d+)'
+            full_line_match = re.search(full_line_pattern, message)
+            if full_line_match:
+                data['sold_count'] = int(full_line_match.group(1))
+                logger.info(f"Extracted from skaneriss (full line): Sold count: {data['sold_count']}")
+        
+        return data
+        
+    async def validate_skaneriss_data(self, token_data: dict) -> bool:
+        """Patikrina, ar token duomenys atitinka reikalavimus siuntimui"""
+        max_hold = TRADING_CONFIG.get('max_hold_count', 14)
+        max_sold_part = TRADING_CONFIG.get('max_sold_part_count', 14)
+        min_sold = TRADING_CONFIG.get('min_sold_count', 33)
+        
+        # Jei nėra duomenų - filtras nepraėjo
+        if 'hold_count' not in token_data or 'sold_part_count' not in token_data or 'sold_count' not in token_data:
+            logger.warning("Missing hold_count, sold_part_count or sold_count in token data")
+            return False
+        
+        # Tikriname ar duomenys atitinka reikalavimus:
+        # - Hold count turi būti MAŽESNIS ARBA LYGUS maksimaliam
+        # - Sold part count turi būti MAŽESNIS ARBA LYGUS maksimaliam
+        # - Sold count turi būti DIDESNIS ARBA LYGUS minimaliam
+        if (token_data['hold_count'] <= max_hold and 
+            token_data['sold_part_count'] <= max_sold_part and 
+            token_data['sold_count'] >= min_sold):
+            
+            logger.info(f"Token data passed validation: hold_count={token_data['hold_count']} (<= {max_hold}), " +
+                       f"sold_part_count={token_data['sold_part_count']} (<= {max_sold_part}), " +
+                       f"sold_count={token_data['sold_count']} (>= {min_sold})")
+            return True
+        else:
+            logger.warning(f"Token data failed validation. Requirements: hold_count <= {max_hold}, " +
+                          f"sold_part_count <= {max_sold_part}, sold_count >= {min_sold}")
+            logger.warning(f"Actual values: hold_count={token_data['hold_count']}, " +
+                          f"sold_part_count={token_data['sold_part_count']}, " +
+                          f"sold_count={token_data.get('sold_count', 'N/A')}")
+            return False
+
+    
+
+    async def setup_skaneriss_handler(self):
+        """Sukuria handler'į skaneriss žinutėms sekti"""
+        @self.client.on(events.NewMessage(chats=['@skaneriss']))
+        async def handle_skaneriss_message(event):
+            try:
+                message = event.message.text
+                message_id = event.message.id
+                
+                logger.info(f"Received message from @skaneriss (ID: {message_id})")
+                
+                # Ieškome tokenų adresų žinutėje
+                token_matches = re.findall(r'[A-Za-z0-9]{32,44}', message)
+                
+                if not token_matches:
+                    logger.info("No token addresses found in skaneriss message")
+                    return
+                
+                # Patikriname kiekvieną token adresą
+                for token_address in token_matches:
+                    if token_address in self.waiting_for_skaneriss:
+                        logger.info(f"Found message for token {token_address} from skaneriss")
+                        
+                        # Ištraukiame duomenis
+                        skaneriss_data = await self.extract_skaneriss_data(message)
+                        
+                        # Išsaugome duomenis
+                        self.skaneriss_data[token_address] = skaneriss_data
+                        
+                        # Pažymime, kad gavome duomenis
+                        if token_address in self.waiting_for_skaneriss:
+                            logger.info(f"Setting event for token {token_address}")
+                            self.waiting_for_skaneriss[token_address].set()
+            
+            except Exception as e:
+                logger.error(f"Error handling skaneriss message: {e}")
+        
+        logger.info("Set up skaneriss message handler")
+
+    async def wait_for_skaneriss_reply(self, token_address: str, timeout: int = None) -> dict:
+        """Laukia atsakymo iš skaneriss grupės ir grąžina surinktus duomenis"""
+        if timeout is None:
+            timeout = TRADING_CONFIG.get('skaneriss_wait_timeout', 180)  # 3 minutės numatytasis laikas
+            
+        logger.info(f"Waiting for skaneriss reply about token {token_address} (timeout: {timeout}s)")
+        
+        # Sukuriame event'ą laukimui
+        event = asyncio.Event()
+        self.waiting_for_skaneriss[token_address] = event
+        
+        # Laukiame kol event'as bus nustatytas arba timeout
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            
+            # Jei event'as nustatytas, duomenys turėtų būti skaneriss_data
+            if token_address in self.skaneriss_data:
+                logger.info(f"Got skaneriss data for {token_address}: {self.skaneriss_data[token_address]}")
+                return self.skaneriss_data[token_address]
+            else:
+                logger.warning(f"Event was set but no data found for {token_address}")
+                return {}
+        except asyncio.TimeoutError:
+            logger.warning(f"Timed out waiting for skaneriss reply for {token_address} after {timeout} seconds")
+            return {}
+        finally:
+            # Valome
+            self.waiting_for_skaneriss.pop(token_address, None)
+
+    async def extract_trenchscanner_data(self, message: str) -> dict:
+        """Ištraukia procentą iš TrenchScannerBot žinutės"""
+        data = {}
+        
+        # Tikriname, ar tai ne "Loading" pranešimas
+        if "Loading bundle data" in message:
+            return {}
+        
+        logger.info(f"FULL TRENCHSCANNER MESSAGE:\n{message}")
+        
+        # Spausdiname visas eilutes su procentu ir Current/Held/Holding žodžiais (diagnostikai)
+        for line in message.split('\n'):
+            if "%" in line:
+                if any(word in line.lower() for word in ["current", "held", "holding", "percentage"]):
+                    logger.info(f"FOUND POTENTIAL PERCENTAGE LINE: '{line}'")
+        
+        # NAUJI REGEX VARIANTAI - pradedame nuo griežčiausio ir einame prie lankstesnių
+        patterns = [
+            # Tiesioginis tikslus formatas su emoji
+            r'📈\s*Current Held Percentage:\s*([\d\.]+)%',
+            
+            # Standartinis formatas su optional emoji ir markdown
+            r'(?:📈)?\s*\*\*Current Held Percentage\*\*:\s*([\d\.]+)%',
+            r'(?:📈)?\s*Current Held Percentage:\s*([\d\.]+)%',
+            
+            # Lankstesnis formatas - bet koks simbolis vietoj emoji
+            r'.\s*Current Held Percentage:?\s*([\d\.]+)%',
+            
+            # Labai lankstus formatas - bet kokie simboliai tarp pagrindinių elementų
+            r'Current\s*Held\s*Percentage.*?([\d\.]+)%', 
+            
+            # Sutrumpinti formatai
+            r'Held\s*Percentage:?\s*([\d\.]+)%',
+            r'Holding\s*Percentage:?\s*([\d\.]+)%',
+            
+            # Absoliučiai bet kokia eilutė su "held" ir procentu
+            r'[Hh]eld.*?([\d\.]+)%',
+        ]
+        
+        # Išbandome kiekvieną regex variantą
+        for i, pattern in enumerate(patterns):
+            match = re.search(pattern, message, re.IGNORECASE | re.DOTALL)
+            if match:
+                try:
+                    data['held_percentage'] = float(match.group(1))
+                    logger.info(f"Extracted percentage using pattern {i+1}: {data['held_percentage']}%")
+                    return data
+                except (ValueError, IndexError) as e:
+                    logger.warning(f"Found match with pattern {i+1} but failed to convert: {e}")
+        
+        # NAUJAS: Jei vis dar neradome, tiesiog bandome rasti bet kokį procentą eilutėse su "hold/held"
+        for line in message.split('\n'):
+            line_lower = line.lower()
+            if any(word in line_lower for word in ['hold', 'held']) and '%' in line:
+                logger.info(f"FOUND HOLD/HELD LINE: '{line}'")
+                
+                # Bandome rasti skaičių + % kombinaciją, net jei tarp jų yra tarpų
+                percent_match = re.search(r'(\d+\.\d+)\s*%', line)
+                if percent_match:
+                    data['held_percentage'] = float(percent_match.group(1))
+                    logger.info(f"Found percentage in hold/held line: {data['held_percentage']}%")
+                    return data
+        
+        # NAUJAS: Absoliutus paskutinis šansas - ieškome bet kokio procento
+        percent_match = re.search(r'(\d+\.\d+)\s*%', message)
+        if percent_match:
+            data['held_percentage'] = float(percent_match.group(1))
+            logger.info(f"Last resort - found some percentage: {data['held_percentage']}%")
+            return data
+        
+        logger.warning(f"Could not find any held percentage in message")
+        return data
+
+    async def setup_trenchscanner_handler(self):
+        """Sukuria handler'ius TrenchScanner žinutėms sekti"""
+        
+        # Naujų žinučių handler
+        @self.client.on(events.NewMessage(chats=['@TrenchScannerBot']))
+        async def handle_new_message(event):
+            try:
+                message = event.message.text
+                message_id = event.message.id
+                
+                logger.info(f"Received message from @TrenchScannerBot (ID: {message_id})")
+                
+                # Jei žinutė yra "Loading bundle data", susiejame ją su paskutiniu token adresu
+                if "Loading bundle data" in message and self.last_token_sent:
+                    token_address = self.last_token_sent
+                    logger.info(f"Mapping 'Loading' message ID {message_id} to token {token_address}")
+                    self.active_requests[message_id] = token_address
+            
+            except Exception as e:
+                logger.error(f"Error handling new message: {e}")
+        
+        # Žinučių redagavimo handler
+        @self.client.on(events.MessageEdited(chats=['@TrenchScannerBot']))
+        async def handle_edited_message(event):
+            try:
+                message = event.message.text
+                message_id = event.message.id
+                
+                logger.info(f"Detected edited message from @TrenchScannerBot (ID: {message_id})")
+                
+                # Pirmiausia ištraukiame duomenis
+                data = await self.extract_trenchscanner_data(message)
+                logger.info(f"Extracted data result: {data}")  # PRIDĖTA: Rodys ką ištraukė
+                
+                # NAUJAS: TIKTAI Shuriken nuorodos tikrinimas
+                token_address = None
+                shuriken_match = re.search(r'Shuriken.*?start=qt-[^-]+-([A-Za-z0-9]{40,45}pump)', message)
+                if shuriken_match:
+                    token_address = shuriken_match.group(1)
+                    logger.info(f"Found token in Shuriken link: {token_address}")
+                # Kitų tikrinimų nebėra!
+                
+                # PATAISYTA: Tikriname ištrauktus duomenis saugiau
+                has_percentage = isinstance(data, dict) and 'held_percentage' in data
+                logger.info(f"Has percentage data: {has_percentage}, token_address: {token_address}")  # PRIDĖTA
+                
+                # Jei turime token_address - išsaugome duomenis NET JEI procentas yra 0.0
+                if token_address and has_percentage:
+                    logger.info(f"Found Current Held Percentage: {data['held_percentage']}% for token: {token_address}")
+                    
+                    # Išsaugome rezultatą
+                    self.trenchscanner_data[token_address] = data
+                    logger.info(f"Data saved to trenchscanner_data for {token_address}")  # PRIDĖTA
+                    
+                    # PATAISYTA: Pasitikriname prieš nustatant eventą
+                    if token_address in self.waiting_for_trenchscanner:
+                        logger.info(f"Setting event for token: {token_address}")
+                        # Sukuriame kopiją prieš nustatant, kad būtų saugu
+                        event_to_set = self.waiting_for_trenchscanner.get(token_address)
+                        if event_to_set:
+                            event_to_set.set()
+                            logger.info(f"Event successfully set for {token_address}")  # PRIDĖTA
+                        else:
+                            logger.warning(f"Event object for {token_address} is None!")  # PRIDĖTA
+                    else:
+                        logger.warning(f"Token {token_address} not in waiting_for_trenchscanner dictionary: {list(self.waiting_for_trenchscanner.keys())}")  # PRIDĖTA
+                elif token_address:
+                    logger.warning(f"Token {token_address} found, but no valid percentage data: {data}")  # PRIDĖTA
+                else:
+                    logger.warning("No token_address could be determined from the message")  # PRIDĖTA
+            
+            except Exception as e:
+                logger.error(f"Error handling edited message: {e}", exc_info=True)
+                import traceback
+                logger.error(traceback.format_exc())  # PRIDĖTA: Išsamus klaidos trasavimas
+
+    async def wait_for_trenchscanner_reply(self, token_address: str, timeout: int = None) -> dict:
+        """Laukia atsakymo iš TrenchScannerBot ir grąžina surinktus duomenis"""
+        if timeout is None:
+            timeout = TRADING_CONFIG.get('trenchscanner_wait_timeout', 30)  # SUMAŽINTA į 30s
+            
+        logger.info(f"Checking for TrenchScannerBot data about token {token_address}")
+
+        # PIRMIAUSIA: Tikriname ar jau turime duomenis
+        if token_address in self.trenchscanner_data:
+            logger.info(f"Data for {token_address} already available, returning immediately: {self.trenchscanner_data[token_address]}")
+            return self.trenchscanner_data[token_address]
+
+        # NAUJAS: Bandome išsiųsti užklausą ir iškart patikrinti ar turime atsakymą
+        # Tai veiks tik jei TrenchScanner atsakymas ateina labai greitai (beveik iškart)
+        await asyncio.sleep(0.1)  # Duodame labai trumpą laiką event loop'ui
+        
+        # Vėl tikriname, ar duomenys jau atsirado per tą trumpą laiką
+        if token_address in self.trenchscanner_data:
+            logger.info(f"Data for {token_address} was just received, returning immediately: {self.trenchscanner_data[token_address]}")
+            return self.trenchscanner_data[token_address]
+        
+        # Jei vis dar neturime duomenų, sukuriame event
+        logger.info(f"No immediate data, waiting for TrenchScannerBot reply (timeout: {timeout}s)")
+        event = asyncio.Event()
+        self.waiting_for_trenchscanner[token_address] = event
+        
+        # PRIDĖTA: Spausdiname informaciją apie laukimo būseną
+        logger.info(f"Set up waiting for {token_address}, waiting tokens: {list(self.waiting_for_trenchscanner.keys())}")
+
+        # Nustatome paskutinį siųstą tokeną
+        self.last_token_sent = token_address
+
+        try:
+            # Dar kartą patikriname prieš laukimą
+            if token_address in self.trenchscanner_data:
+                logger.info(f"Data arrived before waiting: {self.trenchscanner_data[token_address]}")
+                return self.trenchscanner_data[token_address]
+                
+            # PRIDĖTA: Tikrinimo ciklas vietoj paprastos wait
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                # Tikrinti ar duomenys jau yra kas 0.2 sekundės
+                if token_address in self.trenchscanner_data:
+                    logger.info(f"Data arrived during polling: {self.trenchscanner_data[token_address]}")
+                    return self.trenchscanner_data[token_address]
+                    
+                # Vietoj event.wait(), laukiame trumpą laiką ir tikriname vėl
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=0.2)
+                    logger.info(f"Event was set for {token_address}")
+                    break
+                except asyncio.TimeoutError:
+                    # Tai normalu, tiesiog tęsiame ciklą
+                    continue
+            
+            # Paskutinis šansas po ciklo
+            if token_address in self.trenchscanner_data:
+                logger.info(f"Got TrenchScannerBot data for {token_address}: {self.trenchscanner_data[token_address]}")
+                return self.trenchscanner_data[token_address]
+            else:
+                # Praėjo visas laikas ir neturime duomenų
+                logger.warning(f"Timed out waiting for TrenchScannerBot reply for {token_address} after {timeout} seconds")
+                return {}
+                
+        except Exception as e:
+            logger.error(f"Error waiting for TrenchScannerBot: {e}", exc_info=True)
+            return {}
+        finally:
+            # Valome
+            self.waiting_for_trenchscanner.pop(token_address, None)
+
+    async def validate_trenchscanner_data(self, token_data: dict) -> bool:
+        """Patikrina, ar TrenchScannerBot duomenys atitinka reikalavimus"""
+        max_held_percentage = TRADING_CONFIG.get('max_held_percentage', 22.0)
+        
+        # Jei nėra held_percentage duomenų - praleiskime validavimą
+        if 'held_percentage' not in token_data:
+            logger.warning("Missing held_percentage in TrenchScannerBot data, skipping validation")
+            return False
+        
+        # Tikriname ar held_percentage neviršija maksimalaus
+        if token_data['held_percentage'] <= max_held_percentage:
+            logger.info(f"TrenchScannerBot data passed validation: held_percentage={token_data['held_percentage']}% (<= {max_held_percentage}%)")
+            return True
+        else:
+            logger.warning(f"TrenchScannerBot data failed validation. Requirement: held_percentage <= {max_held_percentage}%")
+            logger.warning(f"Actual value: held_percentage={token_data['held_percentage']}%")
+            return False
+                
+    async def start_monitoring(self):
+        """Start the token monitoring system"""
+        try:
+            logger.info("Initializing monitoring system...")
+            await self.initialize_session()
+            
+            logger.info(f"Connecting to Telegram using API ID: {TELEGRAM_API_ID}")
+            await self.client.start()
+            
+            # Patikriname ir loginame kiekvieną kanalą
+            for chat in TELEGRAM_SOURCE_CHATS:
+                try:
+                    entity = await self.client.get_entity(chat)
+                    logger.info(f"Successfully connected to channel: {chat}")
+                    logger.info(f"Channel details: ID={entity.id}, Title={entity.title}")
+                except Exception as e:
+                    logger.error(f"Failed to connect to {chat}: {e}")
+            
+            # Sukuriame skaneriss handler'į
+            await self.setup_skaneriss_handler()
+
+            # NAUJA: Sukuriame TrenchScannerBot handler'į
+            await self.setup_trenchscanner_handler()
+
+            @self.client.on(events.NewMessage(chats=TELEGRAM_SOURCE_CHATS))
+            async def handle_new_message(event):
+                try:
+                    message = event.message.text
+                    message_id = event.message.id
+                    
+                    logger.info(f"Processing new message (ID: {message_id})")
+                    
+                    if message_id in self.last_processed_messages:
+                        logger.info("Message already processed, skipping...")
+                        return
+                    
+                    # Whitelist patikrinimas - apdorojame tik tas žinutes, kuriose yra bent vienas whitelist žodis
+                    message_lower = message.lower()
+                    whitelist_match = False
+                    
+                    for word in self.whitelist_words:
+                        if word.lower() in message_lower:
+                            whitelist_match = True
+                            logger.info(f"Whitelist match found: '{word}'")
+                            break
+                    
+                    if not whitelist_match:
+                        logger.info("No whitelist words found in message, skipping...")
+                        return
+                    
+                    # Blacklist patikrinimas
+                    for phrase in self.blacklist_phrases:
+                        index = message.find(phrase)
+                        if index != -1:
+                            next_char_index = index + len(phrase)
+                            if next_char_index < len(message) and message[next_char_index].isdigit():
+                                continue
+                            return
+                    
+                    # NAUJAS: Ištraukiame papildomus token duomenis
+                    token_details = self.extract_token_details(message)
+                    logger.info(f"Extracted token details: {token_details}")
+                    
+                    # Ieškome visų galimų formatų
+                    matches = []
+                    
+                    # Skaidome žinutę į eilutes
+                    lines = message.split('\n')
+                    for line in lines:
+                        # 1. Originalus formatas (🪙 CA: `token`)
+                        ca_matches = re.findall(r'🪙\s*CA:\s*`([A-Za-z0-9]+)`', line)
+                        if ca_matches:
+                            matches.extend(ca_matches)
+                            
+                        # 2. Mint: formatas
+                        mint_matches = re.findall(r'Mint:\s*([A-Za-z0-9]{32,44})', line)
+                        if mint_matches:
+                            matches.extend(mint_matches)
+                        
+                        # 3. Tiesioginiai token adresai
+                        direct_matches = re.findall(r'(?:^|\s)[`"\']?([A-Za-z0-9]{32,44})[`"\']?(?:\s|$)', line)
+                        if direct_matches:
+                            matches.extend(direct_matches)
+                            
+                        # 4. Token adresai iš URL (tik eilutėse su "New")
+                        cleaned_line = re.sub(r'[*_~`]', '', line)
+                        if "New" in cleaned_line:
+                            url_patterns = [
+                                r'birdeye\.so/token/([A-Za-z0-9]{32,44})',
+                                r'raydium\.io/swap/\?inputCurrency=([A-Za-z0-9]{32,44})',
+                                r'dexscreener\.com/solana/([A-Za-z0-9]{32,44})',
+                                r'dextools\.io/app/solana/pair-explorer/([A-Za-z0-9]{32,44})',
+                                r'gmgn\.ai/sol/token/([A-Za-z0-9]{32,44})',
+                                r'soul_sniper_bot\?start=\d+_([A-Za-z0-9]{32,44})',
+                                r'soul_scanner_bot/chart\?startapp=([A-Za-z0-9]{32,44})'
+                            ]
+                            
+                            for pattern in url_patterns:
+                                url_matches = re.findall(pattern, line)
+                                if url_matches:
+                                    matches.extend(url_matches)
+                    
+                    # Pašaliname dublikatus ir filtruojame
+                    unique_matches = list(set(matches))
+                    valid_matches = [addr for addr in unique_matches if len(addr) >= 32 and len(addr) <= 44]
+                    
+                    if valid_matches:
+                        logger.info(f"Found {len(valid_matches)} valid tokens to process")
+                    
+                    current_time = datetime.now(timezone.utc)
+                    
+                    for token_address in valid_matches:
+                        try:
+                            # NAUJAS: Išsaugome papildomus duomenis apie token'ą
+                            if token_details and token_address not in self.token_extra_data:
+                                self.token_extra_data[token_address] = token_details
+                                logger.info(f"Saved extra data for {token_address}: {token_details}")
+                            
+                            # Patikriname ar nepasiekėme limito
+                            if len(self.monitoring_tokens) >= MAX_CONCURRENT_TOKENS:
+                                logger.warning(f"Maximum concurrent tokens limit reached ({MAX_CONCURRENT_TOKENS}), skipping {token_address}")
+                                continue
+                            
+                            # Patikriname ar token'as šiuo metu monitorinamas
+                            is_currently_monitored = token_address in self.monitoring_tokens
+                            
+                            # Patikriname ar signalas buvo išsiųstas neseniai
+                            was_recently_signaled = False
+                            if token_address in self.sent_signals:
+                                time_since_signal = (current_time - self.sent_signals[token_address]).total_seconds()
+                                was_recently_signaled = time_since_signal < 900  # 15 minučių
+                            
+                            if not is_currently_monitored and not was_recently_signaled:
+                                logger.info(f"Starting monitoring for token: {token_address}")
+                                logger.info(f"Current monitoring tokens: {len(self.monitoring_tokens)}/{MAX_CONCURRENT_TOKENS}")
+                                
+                                # Pridedame į monitoring_tokens
+                                self.monitoring_tokens.add(token_address)
+                                
+                                # Išsaugome pradžios laiką
+                                self.token_start_times[token_address] = current_time
+                                
+                                # Sukuriame monitoringo task'ą
+                                monitoring_task = asyncio.create_task(self.monitor_token(token_address))
+                                monitoring_task.set_name(token_address)
+                            else:
+                                reasons = []
+                                if is_currently_monitored:
+                                    reasons.append("currently being monitored")
+                                if was_recently_signaled:
+                                    reasons.append("recently signaled")
+                                
+                                logger.info(f"Skipping {token_address}: {', '.join(reasons)}")
+                        
+                        except Exception as e:
+                            logger.error(f"Error processing token {token_address}: {e}")
+                    
+                    # Pridedame žinutę į apdorotų sąrašą TIK po sėkmingo apdorojimo
+                    self.last_processed_messages.add(message_id)
+                    await self.cleanup_old_messages()
+                
+                except Exception as e:
+                    logger.error(f"Error handling message: {e}")
+                    logger.error(f"Full error details:", exc_info=True)
+
+            logger.info("Token monitoring system started")
+            await self.client.run_until_disconnected()
+
+        except Exception as e:
+            logger.error(f"Error starting monitoring system: {e}")
+        finally:
+            if self.session:
+                await self.session.close()
+            if self.pumpfun_session:
+                await self.pumpfun_session.close()
+            if self.dexscreener_session:
+                await self.dexscreener_session.close()
+
+    async def get_solanatracker_ath(self, token_address: str) -> Optional[float]:
+        """Get the all-time high price from Solana Tracker API"""
+        try:
+            logger.info(f"Calling Solana Tracker API for ATH of {token_address}")
+            url = f"https://data.solanatracker.io/tokens/{token_address}/ath"
+            
+            headers = {
+                "x-api-key": "51e75c3f-8c9e-4167-a082-3d2aeab5da1c"
+            }
+            
+            logger.info(f"Solana Tracker API request URL: {url}")
+            logger.info(f"Using API key: {headers['x-api-key']}")
+            
+            try:
+                async with self.dexscreener_session.get(url, headers=headers) as response:
+                    status = response.status
+                    logger.info(f"Solana Tracker API response status: {status}")
+                    
+                    if status == 200:
+                        data = await response.json()
+                        logger.info(f"Solana Tracker API raw response: {data}")
+                        
+                        # Check for highest_price directly in the response
+                        if data and 'highest_price' in data:
+                            ath_price = float(data['highest_price'])
+                            logger.info(f"Successfully retrieved Solana Tracker ATH for {token_address}: ${ath_price:.8f}")
+                            return ath_price
+                        else:
+                            logger.warning(f"No ATH data found for {token_address} in Solana Tracker API response")
+                    else:
+                        response_text = await response.text()
+                        logger.warning(f"Solana Tracker API returned non-200 status {status} for {token_address}")
+                        logger.warning(f"Response body: {response_text}")
+            except aiohttp.ClientError as ce:
+                logger.error(f"Network error with Solana Tracker API: {ce}")
+                    
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching ATH from Solana Tracker: {e}", exc_info=True)
+            return None
+
+    async def get_token_creation_time(self, token_address: str) -> Optional[int]:
+        """Get token creation time for age verification - simple version"""
+        try:
+            # Tiesiog naudojame PumpFun API patikrinti ar tokeną galima treidinti
+            price = await self.get_pumpfun_price(token_address)
+            if price is not None:
+                # Jei galime gauti kainą, darome prielaidą, kad token'as jau egzistuoja
+                current_time = int(datetime.now(timezone.utc).timestamp())
+                
+                # Darome prielaidą, kad token'as sukurtas neseniai
+                creation_time = current_time - 120  # 2 minutės atgal
+                creation_date = datetime.fromtimestamp(creation_time, tz=timezone.utc)
+                logger.info(f"Estimated token {token_address} creation time: {creation_date}")
+                return creation_time
+                
+            logger.warning(f"Could not determine creation time for {token_address}")
+            return None
+        except Exception as e:
+            logger.error(f"Error getting token creation time: {e}")
+            return None
+
+    async def generate_ath_signal(self, token_address: str, ath_value: float, current_price: float, confirmation_time: float = 0, recovery_percent: float = 0):
+        """Generate signal when token price crosses ATH after a pullback"""
+        if token_address in self.sent_signals:
+            return False
+
+        try:
+            # Skaičiuojame bendrą stebėjimo laiką
+            current_time = datetime.now(timezone.utc)
+            
+            if token_address not in self.token_start_times:
+                logger.warning(f"No start time recorded for {token_address}")
+                return False
+                
+            start_time = self.token_start_times[token_address]
+            monitoring_duration = (current_time - start_time).total_seconds()
+            
+            # Konvertuojame į minutes ir sekundes
+            minutes, seconds = divmod(int(monitoring_duration), 60)
+            
+            # Tikriname ar stebėjimo trukmė atitinka ribas
+            min_signal_time = TRADING_CONFIG.get('min_signal_time', 60)
+            max_signal_time = TRADING_CONFIG.get('max_signal_time', 1800)
+            
+            if monitoring_duration < min_signal_time:
+                logger.info(f"Monitoring duration ({minutes}m {seconds}s) is below minimum required time ({min_signal_time/60:.1f}m)")
+                logger.info(f"Signal not sent for {token_address} due to insufficient monitoring time")
+                return False
+                
+            if monitoring_duration > max_signal_time:
+                logger.info(f"Monitoring duration ({minutes}m {seconds}s) exceeds maximum allowed time ({max_signal_time/60:.1f}m)")
+                logger.info(f"Signal not sent for {token_address} due to exceeded maximum monitoring time")
+                return False
+                
+            # NAUJAS: Tikriname ar atsigavimo procentas atitinka minimalų reikalavimą
+            min_recovery_percent = TRADING_CONFIG.get('min_recovery_percent', 100)
+            if recovery_percent < min_recovery_percent:
+                logger.info(f"===== INSUFFICIENT RECOVERY DETECTED =====")
+                logger.info(f"Token: {token_address}")
+                logger.info(f"Current recovery: {recovery_percent:.2f}%")
+                logger.info(f"Minimum required recovery: {min_recovery_percent}%")
+                logger.info(f"Signal not sent due to insufficient recovery percentage")
+                return False
+            
+            # NAUJAS: Tikriname ar dabartinis laikas yra leistinuose intervaluose
+            current_time_hm = current_time.strftime('%H:%M')
+            time_in_allowed_interval = False
+            
+            if 'signal_time_intervals' in TRADING_CONFIG:
+                for interval in TRADING_CONFIG['signal_time_intervals']:
+                    start_time = interval['start']
+                    end_time = interval['end']
+                    
+                    # Tikriname ar dabartinis laikas patenka į intervalą
+                    # Specialus atvejis kai intervalas kerta vidurnaktį
+                    if start_time > end_time:  # pvz., start=22:00, end=18:00
+                        if current_time_hm >= start_time or current_time_hm <= end_time:
+                            time_in_allowed_interval = True
+                            logger.info(f"Current time {current_time_hm} is within allowed interval {start_time}-{end_time} (crossing midnight)")
+                            break
+                    else:
+                        if start_time <= current_time_hm <= end_time:
+                            time_in_allowed_interval = True
+                            logger.info(f"Current time {current_time_hm} is within allowed interval {start_time}-{end_time}")
+                            break
+                
+                if not time_in_allowed_interval:
+                    logger.info(f"Current time {current_time_hm} is outside allowed signal time intervals")
+                    logger.info(f"Signal not sent for {token_address} due to time restrictions")
+                    return False
+            else:
+                # Jei intervalai nenustatyti, leidžiame siųsti bet kuriuo metu
+                logger.info("No signal time intervals configured, signals allowed at any time")
+            
+            # Tikriname ar dabartinė kaina viršija minimalų slenkstį
+            min_price_threshold = TRADING_CONFIG.get('min_price_threshold', 0.0001)
+            if current_price < min_price_threshold:
+                logger.info(f"Current price (${current_price:.8f}) below minimum threshold (${min_price_threshold:.8f}), signal not sent")
+                return False
+            
+            previous_ath = self.token_ath.get(token_address, 0)
+            ath_increase_percent = ((ath_value - previous_ath) / previous_ath) * 100 if previous_ath > 0 else 0
+            
+            # Tikriname ar ATH padidėjimas neviršija maksimalios reikšmės
+            max_ath_increase = TRADING_CONFIG.get('max_ath_increase', 15.0)
+            if ath_increase_percent > max_ath_increase:
+                logger.info(f"===== EXCESSIVE ATH INCREASE DETECTED =====")
+                logger.info(f"Token: {token_address}")
+                logger.info(f"Previous ATH: ${previous_ath:.8f}")
+                logger.info(f"New ATH: ${ath_value:.8f}")
+                logger.info(f"ATH increase: {ath_increase_percent:.2f}%")
+                logger.info(f"Maximum allowed increase: {max_ath_increase:.2f}%")
+                logger.info(f"Signal not sent due to excessive ATH increase")
+                return False
+            
+            # NAUJAS: Tikriname, ar jau siųstas užklausimas į @skaneriss, kad nesiųstume pakartotinai
+            if token_address not in self.skaneriss_requests_sent:
+                try:
+                    logger.info(f"Sending token address {token_address} to @skaneriss for validation")
+                    await self.client.send_message('@skaneriss', token_address)
+                    
+                    # NAUJA: Siunčiame tą patį token adresą į @TrenchScannerBot
+                    logger.info(f"Sending token address {token_address} to @TrenchScannerBot")
+                    await self.client.send_message('@TrenchScannerBot', token_address)
+                    
+                    self.skaneriss_requests_sent.add(token_address)  # Pažymime, kad išsiuntėme
+                    self.trenchscanner_requests_sent.add(token_address)  # Pažymime, kad išsiuntėme į TrenchScannerBot
+                    
+                    # Laukiame atgalinio pranešimo su papildoma informacija
+                    token_data = await self.wait_for_skaneriss_reply(token_address)
+                    
+                    # Tikriname, ar gauti duomenys atitinka reikalavimus
+                    if not await self.validate_skaneriss_data(token_data):
+                        logger.info(f"Token {token_address} did not pass skaneriss validation, signal not sent")
+                        return False
+                    
+                    # NAUJA: Laukiame atsakymo iš TrenchScannerBot
+                    trench_data = await self.wait_for_trenchscanner_reply(token_address)
+                    
+                    # Tikriname ar TrenchScannerBot duomenys atitinka reikalavimus
+                    if not await self.validate_trenchscanner_data(trench_data):
+                        logger.info(f"Token {token_address} did not pass TrenchScannerBot validation, signal not sent")
+                        return False
+                    
+                    logger.info(f"Token {token_address} passed all validations, proceeding with signal")
+                except Exception as e:
+                    logger.error(f"Error communicating with validation bots: {e}")
+                    logger.error(f"Skipping signal due to validation failure")
+                    return False
+            else:
+                # Jei jau išsiuntėme užklausimą, naudojame turimus duomenis
+                token_data = self.skaneriss_data.get(token_address, {})
+                if not await self.validate_skaneriss_data(token_data):
+                    logger.info(f"Token {token_address} did not pass skaneriss validation, signal not sent")
+                    return False
+
+                # NAUJA: Laukiame atsakymo iš TrenchScannerBot
+                trench_data = await self.wait_for_trenchscanner_reply(token_address)
+
+                # Tikriname ar TrenchScannerBot duomenys atitinka reikalavimus
+                if not await self.validate_trenchscanner_data(trench_data):
+                    logger.info(f"Token {token_address} did not pass TrenchScannerBot validation, signal not sent")
+                    return False
+
+                # TIK TADA leidžiame siųsti signalą
+                logger.info(f"Token {token_address} passed all validations, proceeding with signal")
+            
+            current_time_str = current_time.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # NAUJAS: Pridedame papildomą informaciją iš GMGN žinutės
+            extra_data = self.token_extra_data.get(token_address, {})
+            
+            message_parts = [
+                f"🚀 **ATH Recovery Signal**\n\n"
+                f"⏰ UTC: {current_time_str}\n"
+                f"📍 Token: `{token_address}`\n\n"
+                
+                f"**💰 Market Data:**\n"
+                f"• Current Price: ${current_price:.8f}\n"
+                f"• ATH: ${ath_value:.8f}\n"
+                f"• Previous ATH: ${previous_ath:.8f}\n"
+                f"• ATH Increase: {ath_increase_percent:.2f}%\n"
+            ]
+            
+            # Pridedame informaciją apie stebėjimo trukmę
+            message_parts.append(f"• Monitoring Duration: {minutes}m {seconds}s\n")
+            
+            # Pridedame informaciją apie nukritimą ir atsigavimą
+            if token_address in self.price_drop_status:
+                drop_data = self.price_drop_status[token_address]
+                message_parts.append(f"• Maximum Drop: {drop_data['max_drop_percent']:.2f}%\n")
+                message_parts.append(f"• Recovery: {recovery_percent:.2f}%\n")
+            
+            # Pridedame informaciją apie patvirtinimą, jei tai buvo ATH patvirtinimas
+            if confirmation_time > 0:
+                message_parts.append(f"• ATH Confirmation Time: {confirmation_time:.1f} seconds\n")
+            
+            # NAUJAS: Pridedame papildomą informaciją iš GMGN žinutės
+            if extra_data:
+                message_parts.append("\n**📊 Token Details:**\n")
+                
+                if 'age' in extra_data:
+                    message_parts.append(f"• Age: {extra_data['age']}\n")
+            
+            # NAUJAS: Pridedame papildomą informaciją iš skaneriss
+            skaneriss_data = self.skaneriss_data.get(token_address, {})
+            if skaneriss_data:
+                message_parts.append("\n**📊 Investor Activity:**\n")
+                if 'hold_count' in skaneriss_data and 'sold_part_count' in skaneriss_data and 'sold_count' in skaneriss_data:
+                    message_parts.append(f"• Hold: {skaneriss_data['hold_count']} | Sold part: {skaneriss_data['sold_part_count']} | Sold: {skaneriss_data['sold_count']}\n")
+
+            # NAUJAS: Pridedame papildomą informaciją iš TrenchScannerBot
+            trenchscanner_data = self.trenchscanner_data.get(token_address, {})
+            if trenchscanner_data and 'held_percentage' in trenchscanner_data:
+                if not any('TrenchScannerBot Data' in part for part in message_parts):
+                    message_parts.append("\n**📊 TrenchScannerBot Data:**\n")
+                message_parts.append(f"• Current Held Percentage: {trenchscanner_data['held_percentage']}%\n")
+            
+            message_parts.append("\n")
+
+            # Signal Analysis section
+            signal_analysis = [
+                f"• Price Drop Detected: ✅",
+                f"• Recovery to ATH: ✅",
+                f"• ATH Confirmed: ✅" if confirmation_time > 0 else f"• ATH Cross Detected: ✅",
+                f"• Skaneriss Validation: ✅"
+            ]
+
+            message_parts.append("**✅ Signal Analysis:**\n" + "\n".join(signal_analysis) + "\n")
+            message_parts.append(f"**💪 Signal Strength:** 100.0%\n")
+
+            # Links section
+            message_parts.append(
+                f"**🔍 Links:**\n"
+                f"• [Birdeye](https://birdeye.so/token/{token_address}?chain=solana)\n"
+                f"• [Raydium](https://raydium.io/swap/?inputCurrency={token_address})\n"
+                f"• [GMGN](https://gmgn.ai/sol/token/{token_address})\n\n"
+                f"⚠️ DYOR! Not financial advice!"
+            )
+
+            final_message = "\n".join(message_parts)
+
+            # Send to all channels
+            signal_sent = False
+            for chat in TELEGRAM_DEST_CHAT:
+                # Skip skaneriss as we already sent token address there
+                if chat == '@skaneriss':
+                    continue
+                    
+                try:
+                    await self.client.send_message(
+                        chat,
+                        final_message,
+                        link_preview=False,
+                        parse_mode='markdown'
+                    )
+                    logger.info(f"ATH recovery signal sent to {chat}")
+                    signal_sent = True
+                except Exception as chat_error:
+                    logger.error(f"Error sending message to {chat}: {chat_error}")
+
+            if signal_sent:
+                self.sent_signals[token_address] = datetime.now(timezone.utc)
+                self.ath_signaled.add(token_address)  # Žymime, kad ATH signalas jau buvo išsiųstas
+                logger.info(f"ATH recovery signal sent for {token_address} after {minutes}m {seconds}s of monitoring")
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Error generating ATH recovery signal: {e}")
+            return False
+
+    async def monitor_token(self, token_address: str):
+        """Main monitoring function for a token with pullback + ATH recovery logic"""
+        try:
+            # Pirma patikriname concurrent tokens limitą
+            if len(self.monitoring_tokens) >= MAX_CONCURRENT_TOKENS:
+                await self.cleanup_token(token_address)
+                return
+
+            # Užregistruojame pradžios laiką, jei dar neįregistruotas
+            if token_address not in self.token_start_times:
+                self.token_start_times[token_address] = datetime.now(timezone.utc)
+                logger.info(f"Registered start time for {token_address}: {self.token_start_times[token_address]}")
+
+            # NAUJAS: Pirma bandome gauti ATH iš Solana Tracker
+            logger.info(f"Trying to get ATH from Solana Tracker for {token_address}")
+            solana_ath = await self.get_solanatracker_ath(token_address)
+
+            # NAUJAS: Jei negauname ATH iš Solana Tracker, nebedarome analizės
+            if solana_ath is None:
+                logger.warning(f"Could not get ATH data from Solana Tracker for {token_address}, skipping monitoring")
+                await self.cleanup_token(token_address)
+                return
+
+            # Gauname tokeno sukūrimo laiką iš paprastesnės funkcijos
+            token_creation_time = await self.get_token_creation_time(token_address)
+            if token_creation_time is None:
+                logger.error(f"Could not get creation time for {token_address}")
+                await self.cleanup_token(token_address)
+                return
+            
+            current_time = int(datetime.now(timezone.utc).timestamp())
+            token_age = current_time - token_creation_time
+            
+            # Atspausdiname token_age, kad būtų matoma ar teisingai skaičiuojama
+            logger.info(f"Token {token_address} age: {token_age} seconds")
+
+            # Tikriname tokeno amžių ir logika aiškiai matoma
+            min_token_age = TRADING_CONFIG.get('min_token_age', 12)
+            if token_age < min_token_age:
+                logger.warning(f"Token {token_address} too young (age: {token_age} seconds), minimum required: {min_token_age} seconds. Skipping...")
+                await self.cleanup_token(token_address)
+                return
+
+            max_token_age = TRADING_CONFIG.get('max_token_age', 300)
+            if token_age > max_token_age:
+                logger.warning(f"Token {token_address} too old (age: {token_age} seconds), maximum allowed: {max_token_age} seconds. Skipping...")
+                await self.cleanup_token(token_address)
+                return
+
+            # Inicializuojame sekimą
+            self.monitoring_tokens.add(token_address)
+            start_time = datetime.now(timezone.utc)
+
+            # Gauname pradinę kainą - reikalinga visada
+            initial_price = await self.get_pumpfun_price(token_address)
+            if initial_price is None:
+                logger.error(f"Could not get initial price for {token_address}")
+                await self.cleanup_token(token_address)
+                return
+                
+            # Inicializuojame tokeno duomenis
+            self.token_start_prices[token_address] = initial_price
+            
+            # Jei turime ATH iš Solana Tracker ir jis didesnis už max_ath_threshold, tikrai nedarome monitoringo
+            if solana_ath and 'max_ath_threshold' in TRADING_CONFIG and solana_ath >= TRADING_CONFIG['max_ath_threshold']:
+                logger.info(f"===== SOLANA TRACKER ATH EXCEEDS THRESHOLD =====")
+                logger.info(f"Token: {token_address}")
+                logger.info(f"Solana Tracker ATH: ${solana_ath:.8f}")
+                logger.info(f"Threshold: ${TRADING_CONFIG['max_ath_threshold']:.8f}")
+                logger.info(f"Skipping monitoring due to ATH threshold")
+                logger.info(f"=====================================")
+                await self.cleanup_token(token_address)
+                return
+            
+            # Jei pradinė kaina iš PumpFun viršija nustatytą ATH ribą IR neturime ATH iš Solana Tracker
+            if not solana_ath and 'max_ath_threshold' in TRADING_CONFIG and initial_price >= TRADING_CONFIG['max_ath_threshold']:
+                logger.info(f"===== INITIAL PRICE EXCEEDS ATH THRESHOLD =====")
+                logger.info(f"Token: {token_address}")
+                logger.info(f"Initial price: ${initial_price:.8f}")
+                logger.info(f"Threshold: ${TRADING_CONFIG['max_ath_threshold']:.8f}")
+                logger.info(f"Skipping monitoring due to ATH threshold")
+                logger.info(f"=====================================")
+                await self.cleanup_token(token_address)
+                return
+            
+            # Naudojame Solana Tracker ATH, jei turime, kitaip pradinę kainą
+            if solana_ath and solana_ath > 0:
+                logger.info(f"Using ATH from Solana Tracker: ${solana_ath:.8f} (instead of initial price: ${initial_price:.8f})")
+                self.token_ath[token_address] = solana_ath
+            else:
+                logger.info(f"No ATH from Solana Tracker, using initial price as ATH: ${initial_price:.8f}")
+                self.token_ath[token_address] = initial_price
+                
+            self.ath_timestamps[token_address] = datetime.now(timezone.utc)
+            
+            # Inicializuojame kainų istoriją
+            if not hasattr(self, 'price_history'):
+                self.price_history = {}
+            self.price_history[token_address] = []
+            
+            # Inicializuojame last_prices kolekciją dėl suderinamumo
+            if not hasattr(self, 'last_prices'):
+                self.last_prices = {}
+            self.last_prices[token_address] = []
+            
+            # Žymimės, kad ATH signalas dar nebuvo išsiųstas
+            token_address not in self.ath_signaled
+            
+            # Inicializuojame ATH kalibravimo statusą
+            self.calibration_status[token_address] = {
+                'start_time': datetime.now(timezone.utc),
+                'max_ath': self.token_ath[token_address],  # Pradedame nuo SolanaTracker ATH arba pradinės kainos
+                'calibrated': False
+            }
+            
+            # Inicializuojame kainos kritimo statusą
+            self.price_drop_status[token_address] = {
+            'min_price': initial_price,  # Minimali stebima kaina
+            'max_drop_percent': 0,       # Maksimalus kritimas procentais
+            'pullback_detected': False,   # Ar jau aptiktas pakankamas nukritimas
+            'min_drop_confirmed': False,  # Ar pasiektas minimalus kritimo procentas
+            'ath_cross_after_drop': False, # Ar po kritimo jau kirsta ATH
+            'ath_cross_time': None,        # Kada po kritimo buvo kirsta ATH
+            # NAUJAS: Min price kalibravimo būsena
+            'min_price_calibration': {
+                'start_time': datetime.now(timezone.utc),
+                'min_price': initial_price,
+                'calibrated': False
+            }
+        }
+            
+            # Inicialiuojame, kad neturime ATH kirtimo kandidato
+            self.ath_cross_candidates.pop(token_address, None)
+            
+            # Rodomos minimalaus atsigavimo reikalavimo patikros
+            min_recovery_percent = TRADING_CONFIG.get('min_recovery_percent', 100)
+            
+            logger.info(f"===== STARTING ATH MONITORING FOR PULLBACKS =====")
+            logger.info(f"Token: {token_address}")
+            logger.info(f"Initial ATH: ${self.token_ath[token_address]:.8f}")
+            logger.info(f"Looking for price drop between {TRADING_CONFIG['min_drop_percent']}% and {TRADING_CONFIG['max_drop_percent']}%")
+            logger.info(f"Minimum required recovery: {min_recovery_percent}%")
+            logger.info(f"Hold/Sold part/Sold requirements: Hold <= {TRADING_CONFIG.get('max_hold_count', 5)}, Sold part <= {TRADING_CONFIG.get('max_sold_part_count', 7)}, Sold >= {TRADING_CONFIG.get('min_sold_count', 40)}")
+
+                        # NAUJA BŪSENOS MAŠINA:
+                        # NAUJA BŪSENOS MAŠINA:
+            # 1. ATH nustatymo fazė - sekame ir atnaujiname ATH
+            # 2. Pullback fazė - stebima ar kaina nukrito pakankamai nuo ATH
+            # 3. Recovery fazė - stebima ar kaina kerta ATH po pullback
+            # 4. Confirmation fazė - laukiama patvirtinimo po ATH kirtimo
+
+            try:
+                while True:
+                    try:
+                        current_time = datetime.now(timezone.utc)
+                        elapsed_time = (current_time - start_time).total_seconds()
+                        total_monitoring_time = (current_time - self.token_start_times[token_address]).total_seconds()
+                        
+                        # Logujame stebėjimo trukmę periodiškai
+                        if int(elapsed_time) % 60 == 0:  # Kas minutę
+                            minutes, seconds = divmod(int(total_monitoring_time), 60)
+                            logger.info(f"Token {token_address} monitoring duration: {minutes}m {seconds}s")
+
+                        if elapsed_time >= TRADING_CONFIG['max_wait_time']:
+                            logger.info(f"Maximum monitoring time reached for {token_address}")
+                            break
+
+                        # Tikriname ar neviršijome bendro leistino monitoringo laiko
+                        max_signal_time = TRADING_CONFIG.get('max_signal_time', 1800)
+                        if total_monitoring_time > max_signal_time:
+                            logger.info(f"===== MAXIMUM MONITORING TIME EXCEEDED =====")
+                            logger.info(f"Token: {token_address}")
+                            minutes, seconds = divmod(int(total_monitoring_time), 60)
+                            logger.info(f"Monitoring duration: {minutes}m {seconds}s")
+                            logger.info(f"Maximum allowed: {max_signal_time/60:.1f}m")
+                            logger.info(f"Stopping monitoring due to exceeded time limit")
+                            await self.cleanup_token(token_address)
+                            break
+
+                        # Gauname dabartinę kainą
+                        current_price = await self.get_pumpfun_price(token_address)
+                        if current_price is None:
+                            logger.warning(f"Could not get current price for {token_address}")
+                            await asyncio.sleep(TRADING_CONFIG['pumpfun_polling_interval'])
+                            continue
+
+                        # Išsaugome kainą į istorijos su laiko žyma
+                        price_entry = {
+                            'price': current_price,
+                            'timestamp': current_time
+                        }
+                        self.price_history[token_address].append(price_entry)
+                        
+                        # Išsaugome kainą į last_prices dėl suderinamumo
+                        self.last_prices[token_address].append(current_price)
+                        if len(self.last_prices[token_address]) > 5:
+                            self.last_prices[token_address] = self.last_prices[token_address][-5:]
+                        
+                        # Valome istorijos duomenis, išlaikydami tik nustatytą intervalą
+                        price_history_minutes = TRADING_CONFIG['price_history_minutes']
+                        cutoff_time = current_time - timedelta(minutes=price_history_minutes)
+                        self.price_history[token_address] = [
+                            entry for entry in self.price_history[token_address]
+                            if entry['timestamp'] >= cutoff_time
+                        ]
+                        
+                        # Gauname kalibravimo statusą
+                        # Gauname kalibravimo statusą
+                        calibration_status = self.calibration_status[token_address]
+
+                        # ĮDĖKITE NAUJĄ KODĄ ČIA - ATH kalibravimo logika (pridėta: minijus05, 2025-05-06 06:45:03)
+                        calibration_time = TRADING_CONFIG.get('ath_calibration_time', 20)  # nustatytas kalibravimo laikas sekundėmis
+
+                        # Tikriname, ar vyksta ATH kalibracija
+                        if not calibration_status['calibrated']:
+                            # Skaičiuojame, kiek laiko praėjo nuo kalibravimo pradžios
+                            time_since_calibration_start = (current_time - calibration_status['start_time']).total_seconds()
+                            
+                            # Jei dabartinė kaina didesnė nei max_ath, atnaujiname max_ath
+                            if current_price > calibration_status['max_ath']:
+                                old_max = calibration_status['max_ath']
+                                calibration_status['max_ath'] = current_price
+                                logger.info(f"New max ATH during calibration: ${current_price:.8f} (old: ${old_max:.8f})")
+                            
+                            # Pranešame apie kalibravimo progresą
+                            if int(time_since_calibration_start) % 5 == 0 and int(time_since_calibration_start) > 0:  # Kas 5 sekundes
+                                remaining = calibration_time - time_since_calibration_start
+                                logger.info(f"ATH calibration in progress: {time_since_calibration_start:.1f}s/{calibration_time}s ({remaining:.1f}s remaining)")
+                                logger.info(f"Current max ATH during calibration: ${calibration_status['max_ath']:.8f}")
+                            
+                            # Tikriname, ar praėjo pakankamai laiko kalibravimui
+                            if time_since_calibration_start >= calibration_time:
+                                # Kalibravimas baigtas, nustatome galutinį ATH
+                                self.token_ath[token_address] = calibration_status['max_ath']
+                                self.ath_timestamps[token_address] = current_time
+                                calibration_status['calibrated'] = True
+                                
+                                logger.info(f"===== ATH CALIBRATION COMPLETE =====")
+                                logger.info(f"Token: {token_address}")
+                                logger.info(f"Calibration duration: {time_since_calibration_start:.1f}s")
+                                logger.info(f"Calibrated ATH: ${self.token_ath[token_address]:.8f}")
+                                logger.info(f"Initial ATH before calibration: ${self.token_start_prices[token_address]:.8f}")
+                                
+                                # Resetiname pullback statuso parametrus su naujai nustatytu ATH
+                                self.price_drop_status[token_address]['min_price'] = calibration_status['max_ath']
+                                
+                                # Skaičiuojame ATH pokytį procentiniu santykiu
+                                ath_increase_percent = ((calibration_status['max_ath'] - self.token_start_prices[token_address]) / 
+                                                      self.token_start_prices[token_address]) * 100
+                                
+                                logger.info(f"ATH increase during calibration: {ath_increase_percent:.2f}%")
+                                
+                                # Jei ATH nepakankamai pakilo per kalibravimą, galima įspėti (bet tęsiam stebėjimą)
+                                min_ath_increase = TRADING_CONFIG.get('min_ath_increase', 0.01)
+                                if ath_increase_percent < min_ath_increase:
+                                    logger.info(f"Insufficient ATH increase during calibration: {ath_increase_percent:.2f}% < {min_ath_increase:.2f}%")
+                                    logger.info(f"Will continue monitoring, but this may not be optimal for ATH recovery signals")
+
+                        # 1. ATH FAZĖ - sekame ir atnaujiname ATH
+                        
+                        
+                        # 1. ATH FAZĖ - sekame ir atnaujiname ATH
+                        # 1. ATH FAZĖ - sekame ir atnaujiname ATH tik jei dar nesame aptikę pullback
+                        current_ath = self.token_ath[token_address]
+
+                        # Jei kaina virš dabartinio ATH IR dar neesame pullback fazėje, atnaujiname jį
+                        if current_price > current_ath and not self.price_drop_status[token_address]['pullback_detected']:
+                            # Tikriname ar ATH padidėjimas neviršija maksimalios reikšmės
+                            ath_increase_percent = ((current_price - current_ath) / current_ath) * 100
+                            max_ath_increase = TRADING_CONFIG.get('max_ath_increase', 70.0)
+                            
+                            if ath_increase_percent > max_ath_increase:
+                                logger.info(f"===== EXCESSIVE ATH INCREASE DETECTED =====")
+                                logger.info(f"Token: {token_address}")
+                                logger.info(f"Previous ATH: ${current_ath:.8f}")
+                                logger.info(f"New potential ATH: ${current_price:.8f}")
+                                logger.info(f"ATH increase: {ath_increase_percent:.2f}%")
+                                logger.info(f"Maximum allowed increase: {max_ath_increase:.2f}%")
+                                logger.info(f"Stopping monitoring due to excessive ATH increase")
+                                
+                                # Sustabdome monitoringą, nes ATH padidėjimas per didelis
+                                await self.cleanup_token(token_address)
+                                break
+                            else:
+                                # Atnaujiname ATH
+                                # Atnaujiname ATH
+                                old_ath = current_ath
+                                self.token_ath[token_address] = current_price
+                                self.ath_timestamps[token_address] = current_time
+
+                                logger.info(f"New ATH detected: ${current_price:.8f} (old: ${old_ath:.8f})")
+
+                                # NAUJAS: Resetiname kalibravimą, kad jis vyktų po kiekvieno ATH atnaujinimo
+                                calibration_status['calibrated'] = False  # Resetiname kalibravimo statusą
+                                calibration_status['start_time'] = current_time  # Nustatome naują pradžios laiką
+                                calibration_status['max_ath'] = current_price  # Pradedame nuo naujo ATH
+
+                                logger.info(f"===== STARTING NEW ATH CALIBRATION =====")
+                                logger.info(f"Token: {token_address}")
+                                logger.info(f"New base ATH for calibration: ${current_price:.8f}")
+                                logger.info(f"Calibration duration set to: {calibration_time} seconds")
+
+                                # Resetiname pullback statuso parametrus, nes kaina nekrečia, o auga
+                                self.price_drop_status[token_address]['min_price'] = current_price
+
+                        # 2. PULLBACK FAZĖ - Stebime nukritimą nuo ATH
+                        # 2. PULLBACK FAZĖ - Stebime nukritimą nuo ATH
+                        current_ath = self.token_ath[token_address]
+                        drop_status = self.price_drop_status[token_address]
+
+                        # NAUJAS: Min price kalibravimo logika (pridėta: minijus05, 2025-05-06 06:50:26)
+                        min_price_calibration = drop_status.get('min_price_calibration', {
+                            'start_time': current_time,
+                            'min_price': current_price,
+                            'calibrated': False
+                        })
+
+                        # Saugome min price kalibravimo būseną, jei jos dar nėra
+                        if 'min_price_calibration' not in drop_status:
+                            drop_status['min_price_calibration'] = min_price_calibration
+
+                        min_price_calibration_time = TRADING_CONFIG.get('min_price_calibration_time', 20)  # kalibravimo laikas sekundėmis
+
+                        # Tikriname, ar vyksta min price kalibracija
+                        if not min_price_calibration['calibrated']:
+                            # Skaičiuojame, kiek laiko praėjo nuo kalibravimo pradžios
+                            time_since_min_calibration = (current_time - min_price_calibration['start_time']).total_seconds()
+                            
+                            # Jei dabartinė kaina mažesnė nei min_price, atnaujiname min_price
+                            if current_price < min_price_calibration['min_price']:
+                                old_min = min_price_calibration['min_price']
+                                min_price_calibration['min_price'] = current_price
+                                logger.info(f"New min price during calibration: ${current_price:.8f} (old: ${old_min:.8f})")
+                            
+                            # Pranešame apie kalibravimo progresą
+                            if int(time_since_min_calibration) % 5 == 0 and int(time_since_min_calibration) > 0:  # Kas 5 sekundes
+                                remaining = min_price_calibration_time - time_since_min_calibration
+                                logger.info(f"Min price calibration in progress: {time_since_min_calibration:.1f}s/{min_price_calibration_time}s ({remaining:.1f}s remaining)")
+                                logger.info(f"Current min price during calibration: ${min_price_calibration['min_price']:.8f}")
+                            
+                            # Tikriname, ar praėjo pakankamai laiko kalibravimui
+                            if time_since_min_calibration >= min_price_calibration_time:
+                                # Kalibravimas baigtas, nustatome galutinę minimalią kainą
+                                drop_status['min_price'] = min_price_calibration['min_price']
+                                min_price_calibration['calibrated'] = True
+                                
+                                logger.info(f"===== MIN PRICE CALIBRATION COMPLETE =====")
+                                logger.info(f"Token: {token_address}")
+                                logger.info(f"Calibration duration: {time_since_min_calibration:.1f}s")
+                                logger.info(f"Calibrated min price: ${drop_status['min_price']:.8f}")
+                                
+                                # Skaičiuojame drop procentą nuo ATH
+                                drop_percent = ((current_ath - drop_status['min_price']) / current_ath) * 100
+                                drop_status['max_drop_percent'] = drop_percent
+                                
+                                logger.info(f"Current drop from ATH after min price calibration: {drop_percent:.2f}%")
+                        
+                        # Jei dar nesame aptikę pullback
+                        if not drop_status['pullback_detected']:
+                            # Jei dabartinė kaina yra mažesnė nei minimali stebima kaina, atnaujiname
+                            if current_price < drop_status['min_price']:
+                                drop_status['min_price'] = current_price
+
+                                # NAUJAS: Resetiname min price kalibravimą (pridėta: minijus05, 2025-05-06 06:55:31)
+                                min_price_calibration = drop_status['min_price_calibration']
+                                min_price_calibration['calibrated'] = False  # Resetiname kalibravimo statusą
+                                min_price_calibration['start_time'] = current_time  # Nustatome naują pradžios laiką
+                                min_price_calibration['min_price'] = current_price  # Pradedame nuo naujos min price
+
+                                logger.info(f"===== STARTING NEW MIN PRICE CALIBRATION =====")
+                                logger.info(f"Token: {token_address}")
+                                logger.info(f"New base min price for calibration: ${current_price:.8f}")
+                                logger.info(f"Calibration duration set to: {min_price_calibration_time} seconds")
+                                
+                                # Skaičiuojame dabartinį kritimą procentais
+                                drop_percent = ((current_ath - current_price) / current_ath) * 100
+                                drop_status['max_drop_percent'] = drop_percent
+                                
+                                logger.info(f"New minimum price for {token_address}: ${current_price:.8f}")
+                                logger.info(f"Current drop from ATH: {drop_percent:.2f}%")
+                                
+                                # Tikriname ar pasiektas minimalus kritimas
+                                min_drop_percent = TRADING_CONFIG.get('min_drop_percent', 30)
+                                max_drop_percent = TRADING_CONFIG.get('max_drop_percent', 75)
+                                
+                                if min_drop_percent <= drop_percent <= max_drop_percent and not drop_status['min_drop_confirmed']:
+                                    logger.info(f"===== PULLBACK DETECTED =====")
+                                    logger.info(f"Token: {token_address}")
+                                    logger.info(f"ATH: ${current_ath:.8f}")
+                                    logger.info(f"Current price: ${current_price:.8f}")
+                                    logger.info(f"Drop percent: {drop_percent:.2f}%")
+                                    logger.info(f"Drop is within target range of {min_drop_percent}% - {max_drop_percent}%")
+                                    logger.info(f"Now waiting for recovery to ATH")
+                                    
+                                    # Žymime, kad pasiektas minimalus kritimas
+                                    drop_status['min_drop_confirmed'] = True
+                                    drop_status['pullback_detected'] = True
+                                
+                                # Tikriname ar viršytas maksimalus kritimas
+                                elif drop_percent > max_drop_percent:
+                                    logger.info(f"===== EXCESSIVE DROP DETECTED =====")
+                                    logger.info(f"Token: {token_address}")
+                                    logger.info(f"ATH: ${current_ath:.8f}")
+                                    logger.info(f"Current price: ${current_price:.8f}")
+                                    logger.info(f"Drop percent: {drop_percent:.2f}%")
+                                    logger.info(f"Drop exceeds maximum target of {max_drop_percent}%")
+                                    logger.info(f"Stopping monitoring due to excessive drop")
+                                    
+                                    # Sustabdome monitoringą, nes kritimas per didelis
+                                    await self.cleanup_token(token_address)
+                                    break
+                        
+                        # 3. RECOVERY FAZĖ - Jau aptiktas pullback, laukiame ATH kirtimo
+                        elif drop_status['pullback_detected'] and not drop_status['ath_cross_after_drop']:
+                            # Skaičiuojame recovery procentą
+                            recovery_percent = ((current_price - drop_status['min_price']) / drop_status['min_price']) * 100
+                            
+                            # Spausdiname dabartinį atsigavimo procentą ir minimalų/maksimalų reikalavimą
+                            min_recovery_percent = TRADING_CONFIG.get('min_recovery_percent', 100)
+                            max_recovery_percent = TRADING_CONFIG.get('max_recovery_percent', 1000)
+                            
+                            logger.info(f"Current recovery: {recovery_percent:.2f}% (Minimum required: {min_recovery_percent}%, Maximum allowed: {max_recovery_percent}%)")
+                            
+                            # Tikriname ar atsigavimas neviršija maksimalaus leistino
+                            if recovery_percent > max_recovery_percent:
+                                logger.info(f"===== EXCESSIVE RECOVERY DETECTED =====")
+                                logger.info(f"Token: {token_address}")
+                                logger.info(f"Current recovery: {recovery_percent:.2f}%")
+                                logger.info(f"Maximum allowed: {max_recovery_percent}%")
+                                logger.info(f"Stopping monitoring due to excessive recovery")
+                                
+                                # Sustabdome monitoringą, nes atsigavimas per didelis
+                                await self.cleanup_token(token_address)
+                                break
+                            
+                            # Tikriname ar kaina kerta ATH po pullback
+                            if current_price >= current_ath:
+                                # Tikriname ar ATH padidėjimas neviršija maksimalios reikšmės
+                                ath_increase_percent = ((current_price - current_ath) / current_ath) * 100
+                                max_ath_increase = TRADING_CONFIG.get('max_ath_increase', 70.0)
+                                
+                                if ath_increase_percent > max_ath_increase:
+                                    logger.info(f"===== EXCESSIVE ATH INCREASE DURING RECOVERY =====")
+                                    logger.info(f"Token: {token_address}")
+                                    logger.info(f"Previous ATH: ${current_ath:.8f}")
+                                    logger.info(f"New potential ATH: ${current_price:.8f}")
+                                    logger.info(f"ATH increase: {ath_increase_percent:.2f}%")
+                                    logger.info(f"Maximum allowed increase: {max_ath_increase:.2f}%")
+                                    logger.info(f"Stopping monitoring due to excessive ATH increase")
+                                    
+                                    # Sustabdome monitoringą, nes ATH padidėjimas per didelis
+                                    await self.cleanup_token(token_address)
+                                    break
+                                
+                                # NAUJAS: Tikriname ar atsigavimas atitinka minimalų reikalavimą
+                                elif recovery_percent < min_recovery_percent:
+                                    logger.info(f"===== INSUFFICIENT RECOVERY DETECTED =====")
+                                    logger.info(f"Token: {token_address}")
+                                    logger.info(f"ATH: ${current_ath:.8f}")
+                                    logger.info(f"Current price: ${current_price:.8f}")
+                                    logger.info(f"Current recovery: {recovery_percent:.2f}%")
+                                    logger.info(f"Minimum required recovery: {min_recovery_percent}%")
+                                    logger.info(f"Continuing to monitor for sufficient recovery")
+                                    
+                                    # Tęsiame stebėjimą, bet nekertame į confirmation fazę
+                                
+                                else:
+                                    logger.info(f"===== ATH CROSSED AFTER PULLBACK =====")
+                                    logger.info(f"Token: {token_address}")
+                                    logger.info(f"ATH: ${current_ath:.8f}")
+                                    logger.info(f"Current price: ${current_price:.8f}")
+                                    logger.info(f"Previous min price: ${drop_status['min_price']:.8f}")
+                                    logger.info(f"Recovery: {recovery_percent:.2f}% (meets minimum requirement of {min_recovery_percent}%)")
+                                    logger.info(f"Starting confirmation timer of {TRADING_CONFIG['ath_confirmation_time']} seconds")
+                                    
+                                    # Žymime, kad kirsta ATH po pullback
+                                    drop_status['ath_cross_after_drop'] = True
+                                    drop_status['ath_cross_time'] = current_time
+                            else:
+                                # Vis dar laukiame ATH kirtimo
+                                logger.info(f"Waiting for recovery to ATH - Current recovery from pullback: {recovery_percent:.2f}%")
+                                
+                                # Jei turime naują minimalią kainą, atnaujiname
+                                if current_price < drop_status['min_price']:
+                                    logger.info(f"New minimum price during recovery for {token_address}: ${current_price:.8f}")
+                                    drop_status['min_price'] = current_price
+
+                                    # NAUJAS: Resetiname min price kalibravimą recovery fazėje (pridėta: minijus05, 2025-05-06 07:10:15)
+                                    min_price_calibration = drop_status['min_price_calibration']
+                                    min_price_calibration['calibrated'] = False  # Resetiname kalibravimo statusą
+                                    min_price_calibration['start_time'] = current_time  # Nustatome naują pradžios laiką
+                                    min_price_calibration['min_price'] = current_price  # Pradedame nuo naujos min price
+
+                                    logger.info(f"===== STARTING NEW MIN PRICE CALIBRATION DURING RECOVERY =====")
+                                    logger.info(f"Token: {token_address}")
+                                    logger.info(f"New base min price for calibration: ${current_price:.8f}")
+                                    logger.info(f"Calibration duration set to: {min_price_calibration_time} seconds")
+                                    
+                                    # Perskaičiuojame dabartinį kritimą procentais
+                                    new_drop_percent = ((current_ath - current_price) / current_ath) * 100
+                                    drop_status['max_drop_percent'] = new_drop_percent
+                                    
+                                    # Tikriname ar neviršytas maksimalus kritimas
+                                    max_drop_percent = TRADING_CONFIG.get('max_drop_percent', 75)
+                                    if new_drop_percent > max_drop_percent:
+                                        logger.info(f"===== EXCESSIVE DROP DETECTED DURING RECOVERY =====")
+                                        logger.info(f"Token: {token_address}")
+                                        logger.info(f"ATH: ${current_ath:.8f}")
+                                        logger.info(f"Current price: ${current_price:.8f}")
+                                        logger.info(f"Drop percent: {new_drop_percent:.2f}%")
+                                        logger.info(f"Drop exceeds maximum target of {max_drop_percent}%")
+                                        logger.info(f"Stopping monitoring due to excessive drop")
+                                        
+                                        # Sustabdome monitoringą, nes kritimas per didelis
+                                        await self.cleanup_token(token_address)
+                                        break
+                        
+                        # 4. CONFIRMATION FAZĖ - Po ATH kirtimo laukiame nustatyto laiko patvirtinimo
+                        elif drop_status['ath_cross_after_drop']:
+                            # Skaičiuojame laiką nuo ATH kirtimo
+                            time_since_cross = (current_time - drop_status['ath_cross_time']).total_seconds()
+                            confirmation_time = TRADING_CONFIG.get('ath_confirmation_time', 10)  # nustatytas laikas sekundėmis
+                            
+                            # Tikriname ar praėjo patvirtinimo laikas
+                            if time_since_cross >= confirmation_time:
+                                # Patikrinkime ar kaina vis dar aukščiau ATH
+                                if current_price >= current_ath:
+                                    # Kaina vis dar virš ATH - patvirtintas kirtimas
+                                    recovery_percent = ((current_price - drop_status['min_price']) / drop_status['min_price']) * 100
+                                    
+                                    # Tikriname ar atsigavimas vis dar pakankamas
+                                    min_recovery_percent = TRADING_CONFIG.get('min_recovery_percent', 100)
+                                    
+                                    if recovery_percent < min_recovery_percent:
+                                        logger.info(f"===== RECOVERY REDUCED DURING CONFIRMATION =====")
+                                        logger.info(f"Token: {token_address}")
+                                        logger.info(f"Current recovery: {recovery_percent:.2f}%")
+                                        logger.info(f"Minimum required: {min_recovery_percent}%")
+                                        logger.info(f"Resetting to recovery phase to wait for sufficient recovery")
+                                        
+                                        # Grįžtame į recovery fazę
+                                        drop_status['ath_cross_after_drop'] = False
+                                        continue
+                                    
+                                    # Tikriname dar kartą ar ATH padidėjimas neviršija maksimalios reikšmės
+                                    ath_increase_percent = ((current_price - current_ath) / current_ath) * 100
+                                    max_ath_increase = TRADING_CONFIG.get('max_ath_increase', 70.0)
+                                    
+                                    if ath_increase_percent > max_ath_increase:
+                                        logger.info(f"===== EXCESSIVE ATH INCREASE DURING CONFIRMATION =====")
+                                        logger.info(f"Token: {token_address}")
+                                        logger.info(f"Previous ATH: ${current_ath:.8f}")
+                                        logger.info(f"New confirmed ATH: ${current_price:.8f}")
+                                        logger.info(f"ATH increase: {ath_increase_percent:.2f}%")
+                                        logger.info(f"Maximum allowed increase: {max_ath_increase:.2f}%")
+                                        logger.info(f"Stopping monitoring due to excessive ATH increase")
+                                        
+                                        # Sustabdome monitoringą, nes ATH padidėjimas per didelis
+                                        await self.cleanup_token(token_address)
+                                        break
+                                    else:
+                                        logger.info(f"===== ATH RECOVERY CONFIRMED =====")
+                                        logger.info(f"Token: {token_address}")
+                                        logger.info(f"ATH: ${current_ath:.8f}")
+                                        logger.info(f"Current price: ${current_price:.8f}")
+                                        logger.info(f"Maximum drop: {drop_status['max_drop_percent']:.2f}%")
+                                        logger.info(f"Recovery: {recovery_percent:.2f}%")
+                                        
+                                        # Skaičiuojame bendrą stebėjimo laiką
+                                        total_monitoring_time = (current_time - self.token_start_times[token_address]).total_seconds()
+                                        minutes, seconds = divmod(int(total_monitoring_time), 60)
+                                        logger.info(f"Total monitoring time: {minutes}m {seconds}s")
+                                        
+                                        # Tikriname ar stebėjimo trukmė atitinka ribas
+                                        min_signal_time = TRADING_CONFIG.get('min_signal_time', 120)
+                                        max_signal_time = TRADING_CONFIG.get('max_signal_time', 1200)
+                                        
+                                        if total_monitoring_time < min_signal_time:
+                                            logger.info(f"Monitoring duration too short ({minutes}m {seconds}s < {min_signal_time/60:.1f}m), waiting more time before signaling")
+                                            # Grįžtame į recovery fazę, kad palauktume daugiau laiko
+                                            drop_status['ath_cross_after_drop'] = False
+                                            continue
+                                            
+                                        if total_monitoring_time > max_signal_time:
+                                            logger.info(f"Monitoring duration exceeds maximum allowed time ({minutes}m {seconds}s > {max_signal_time/60:.1f}m)")
+                                            logger.info(f"Stopping monitoring without signal")
+                                            await self.cleanup_token(token_address)
+                                            break
+                                        
+                                        logger.info(f"Confirmation complete, sending signal")
+                                        
+                                        # Siunčiame ATH recovery signalą
+                                        success = await self.generate_ath_signal(
+                                            token_address, 
+                                            current_price, 
+                                            current_price, 
+                                            time_since_cross,
+                                            recovery_percent
+                                        )
+                                        
+                                        if success:
+                                            logger.info(f"ATH recovery signal sent for {token_address}, stopping monitoring")
+                                            break
+                                        else:
+                                            logger.warning(f"Failed to send ATH recovery signal for {token_address}")
+                                            # Tęsiame monitoringą
+                                            drop_status['ath_cross_after_drop'] = False
+                                else:
+                                    # Kaina nukrito žemiau ATH per patvirtinimo periodą
+                                    logger.info(f"===== ATH RECOVERY REJECTED =====")
+                                    logger.info(f"Token: {token_address}")
+                                    logger.info(f"ATH: ${current_ath:.8f}")
+                                    logger.info(f"Current price: ${current_price:.8f}")
+                                    logger.info(f"Price dropped below ATH during confirmation period")
+                                    logger.info(f"Continuing to monitor for recovery")
+                                    
+                                    # Grįžtame į recovery fazę
+                                    drop_status['ath_cross_after_drop'] = False
+                            else:
+                                # Dar laukiame patvirtinimo
+                                remaining_time = confirmation_time - time_since_cross
+                                logger.info(f"Waiting for ATH recovery confirmation: {time_since_cross:.1f}s/{confirmation_time}s ({remaining_time:.1f}s remaining)")
+                                logger.info(f"Current price: ${current_price:.8f}")
+                                logger.info(f"ATH: ${current_ath:.8f}")
+                                
+                                # Skaičiuojame dabartinį recovery
+                                recovery_percent = ((current_price - drop_status['min_price']) / drop_status['min_price']) * 100
+                                min_recovery_percent = TRADING_CONFIG.get('min_recovery_percent', 100)
+                                
+                                # Nuolat tikriname ar recovery vis dar pakankamas
+                                if recovery_percent < min_recovery_percent:
+                                    logger.info(f"Recovery dropped below minimum requirement during confirmation: {recovery_percent:.2f}% < {min_recovery_percent}%")
+                                    logger.info(f"Resetting to recovery phase")
+                                    drop_status['ath_cross_after_drop'] = False
+                            
+                            # Jeigu kaina per patvirtinimo periodą vėl nukrito žemiau ATH
+                            if current_price < current_ath:
+                                logger.info(f"Price dropped below ATH during confirmation, resetting recovery wait")
+                                drop_status['ath_cross_after_drop'] = False
+
+                        # Tikriname ar pasiektas maksimalus leistinas ATH
+                        if 'max_ath_threshold' in TRADING_CONFIG and current_price >= TRADING_CONFIG['max_ath_threshold']:
+                            logger.info(f"===== MAXIMUM ATH THRESHOLD REACHED =====")
+                            logger.info(f"Token: {token_address}")
+                            logger.info(f"Current price: ${current_price:.8f}")
+                            logger.info(f"Threshold: ${TRADING_CONFIG['max_ath_threshold']:.8f}")
+                            logger.info(f"Stopping monitoring due to ATH threshold")
+                            logger.info(f"=====================================")
+                            await self.cleanup_token(token_address)
+                            break
+
+                        # Tikriname kainų aktyvumą
+                        if len(self.last_prices[token_address]) >= 5:
+                            max_price = max(self.last_prices[token_address])
+                            min_price_recent = min(self.last_prices[token_address])
+                            price_diff_percent = ((max_price - min_price_recent) / max_price) * 100
+
+                            if price_diff_percent < 1.0:
+                                logger.info(f"===== PRICE INACTIVITY DETECTED =====")
+                                logger.info(f"Token: {token_address}")
+                                logger.info(f"Last prices: {self.last_prices[token_address]}")
+                                logger.info(f"Price difference: {price_diff_percent:.4f}%")
+                                logger.info(f"Stopping monitoring due to price inactivity")
+                                logger.info(f"=====================================")
+                                await self.cleanup_token(token_address)
+                                break
+
+                        await asyncio.sleep(TRADING_CONFIG['pumpfun_polling_interval'])
+
+                    except Exception as e:
+                        logger.error(f"Error in monitoring loop: {e}", exc_info=True)
+                        await asyncio.sleep(TRADING_CONFIG['pumpfun_polling_interval'])
+                        continue
+
+            finally:
+                logger.info(f"Stopping monitoring for {token_address}")
+                await self.cleanup_token(token_address)
+
+        except Exception as e:
+            logger.error(f"Error monitoring token {token_address}: {e}")
+            await self.cleanup_token(token_address)
+
+    async def cleanup_token(self, token_address: str):
+        """Enhanced cleanup method"""
+        try:
+            # Valome token'o duomenis
+            self.token_start_prices.pop(token_address, None)
+            self.token_start_times.pop(token_address, None)
+            self.token_ath.pop(token_address, None)
+            self.ath_timestamps.pop(token_address, None)
+            self.ath_signaled.discard(token_address)
+            self.calibration_status.pop(token_address, None)
+            self.ath_cross_candidates.pop(token_address, None)
+            self.price_drop_status.pop(token_address, None)
+            self.skaneriss_requests_sent.discard(token_address)  # Pašaliname iš išsiųstų užklausų sąrašo
+            
+            # Valome token ekstra duomenis
+            if hasattr(self, 'token_extra_data'):
+                self.token_extra_data.pop(token_address, None)
+            
+            # Valome kainų istorijos duomenis
+            if hasattr(self, 'price_history'):
+                self.price_history.pop(token_address, None)
+            
+            # Valome skaneriss duomenis
+            if hasattr(self, 'skaneriss_data'):
+                self.skaneriss_data.pop(token_address, None)
+            
+            # Valome event'us
+            if token_address in self.waiting_for_skaneriss:
+                self.waiting_for_skaneriss[token_address].set()  # Nustatome event'ą, kad nebūtų laukimo
+                self.waiting_for_skaneriss.pop(token_address, None)
+            
+            # Valome kitus duomenis
+            self.monitoring_tokens.discard(token_address)
+            if hasattr(self, 'last_prices'):
+                self.last_prices.pop(token_address, None)
+
+            # NAUJA: Valome TrenchScannerBot duomenis
+            self.trenchscanner_data.pop(token_address, None)
+            self.trenchscanner_requests_sent.discard(token_address)
+            
+            # Valome event'us
+            if token_address in self.waiting_for_trenchscanner:
+                self.waiting_for_trenchscanner[token_address].set()  # Nustatome event'ą, kad nebūtų laukimo
+                self.waiting_for_trenchscanner.pop(token_address, None)
+            
+            logger.info(f"Cleaned up all data for {token_address}")
+        except Exception as e:
+            logger.error(f"Error cleaning up token {token_address}: {e}")
+
+async def main():
+    """Main entry point"""
+    monitor = TokenPriceMonitor()
+
+    try:
+        await monitor.initialize_session()
+        await monitor.start_monitoring()
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    except Exception as e:
+        logger.error(f"Main error: {e}")
+    finally:
+        for token in list(monitor.monitoring_tokens):
+            await monitor.cleanup_token(token)
+        if monitor.session:
+            await monitor.session.close()
+        if monitor.pumpfun_session:
+            await monitor.pumpfun_session.close()
+        if monitor.dexscreener_session:
+            await monitor.dexscreener_session.close()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nProgram terminated by user")
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        logger.critical(f"Fatal error: {e}")
